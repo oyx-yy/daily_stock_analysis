@@ -14,6 +14,7 @@
 - 多头排列：MA5 > MA10 > MA20
 - 乖离率：(Close - MA5) / MA5 < 5%（不追高）
 - 量能形态：缩量回调优先
+- 新增BOLL：布林带判断超买超卖，辅助支撑压力分析
 """
 
 import logging
@@ -21,9 +22,11 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List
 from enum import Enum
 
+
 import pandas as pd
 import numpy as np
 
+import pandas_ta as ta
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -79,6 +82,15 @@ class RSIStatus(Enum):
     OVERSOLD = "超卖"         # RSI < 30
 
 
+class BOLLStatus(Enum):
+    """BOLL（布林带）状态枚举"""
+    OVER_UPPER = "突破上轨"    # 价格突破上轨，超买
+    ABOVE_MID = "中轨上方"     # 价格在中轨和上轨之间，多头强势
+    BELOW_MID = "中轨下方"     # 价格在中轨和下轨之间，空头弱势
+    UNDER_LOWER = "跌破下轨"    # 价格跌破下轨，超卖
+    CONSOLIDATION = "布林缩口"  # 布林带缩口，震荡整理
+
+
 @dataclass
 class TrendAnalysisResult:
     """趋势分析结果"""
@@ -126,6 +138,15 @@ class TrendAnalysisResult:
     rsi_status: RSIStatus = RSIStatus.NEUTRAL
     rsi_signal: str = ""              # RSI 信号描述
 
+    # BOLL（布林带）指标 - 新增
+    boll_upper: float = 0.0         # 布林上轨
+    boll_mid: float = 0.0           # 布林中轨（默认20日均线）
+    boll_lower: float = 0.0         # 布林下轨
+    boll_bandwidth: float = 0.0     # 布林带宽（波动率）
+    boll_percent: float = 0.0       # 布林百分比（价格在布林带中的位置 0-100）
+    boll_status: BOLLStatus = BOLLStatus.CONSOLIDATION
+    boll_signal: str = ""           # BOLL 信号描述
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -165,6 +186,14 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            # BOLL 新增字段
+            'boll_upper': self.boll_upper,
+            'boll_mid': self.boll_mid,
+            'boll_lower': self.boll_lower,
+            'boll_bandwidth': self.boll_bandwidth,
+            'boll_percent': self.boll_percent,
+            'boll_status': self.boll_status.value,
+            'boll_signal': self.boll_signal,
         }
 
 
@@ -179,6 +208,7 @@ class StockTrendAnalyzer:
     4. 买点识别 - 回踩 MA5/MA10 支撑
     5. MACD 指标 - 趋势确认和金叉死叉信号
     6. RSI 指标 - 超买超卖判断
+    7. BOLL 指标 - 布林带超买超卖+支撑压力分析（新增）
     """
     
     # 交易参数配置（BIAS_THRESHOLD 从 Config 读取，见 _generate_signal）
@@ -188,15 +218,19 @@ class StockTrendAnalyzer:
 
     # MACD 参数（标准12/26/9）
     MACD_FAST = 12              # 快线周期
-    MACD_SLOW = 26             # 慢线周期
+    MACD_SLOW = 26              # 慢线周期
     MACD_SIGNAL = 9             # 信号线周期
 
     # RSI 参数
     RSI_SHORT = 6               # 短期RSI周期
-    RSI_MID = 12               # 中期RSI周期
-    RSI_LONG = 24              # 长期RSI周期
-    RSI_OVERBOUGHT = 70        # 超买阈值
-    RSI_OVERSOLD = 30          # 超卖阈值
+    RSI_MID = 12                # 中期RSI周期
+    RSI_LONG = 24               # 长期RSI周期
+    RSI_OVERBOUGHT = 70         # 超买阈值
+    RSI_OVERSOLD = 30           # 超卖阈值
+
+    # BOLL（布林带）参数 - 新增
+    BOLL_LENGTH = 20            # 布林带周期（默认20）
+    BOLL_STD = 2.0              # 标准差倍数（默认2）
     
     def __init__(self):
         """初始化分析器"""
@@ -230,6 +264,9 @@ class StockTrendAnalyzer:
         df = self._calculate_macd(df)
         df = self._calculate_rsi(df)
 
+        # 计算 BOLL（布林带） - 新增
+        df = self._calculate_boll(df)
+
         # 获取最新数据
         latest = df.iloc[-1]
         result.current_price = float(latest['close'])
@@ -256,7 +293,10 @@ class StockTrendAnalyzer:
         # 6. RSI 分析
         self._analyze_rsi(df, result)
 
-        # 7. 生成买入信号
+        # 7. BOLL 分析 - 新增
+        self._analyze_boll(df, result)
+
+        # 8. 生成买入信号（包含BOLL评分）
         self._generate_signal(result)
 
         return result
@@ -334,6 +374,38 @@ class StockTrendAnalyzer:
             col_name = f'RSI_{period}'
             df[col_name] = rsi
 
+        return df
+    
+    def _calculate_boll(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算 BOLL（布林带）指标 - 新增
+        
+        公式：
+        - 中轨（MID）：N日移动平均线（默认20）
+        - 上轨（UPPER）：MID + 2*N日收盘价标准差
+        - 下轨（LOWER）：MID - 2*N日收盘价标准差
+        - 带宽（Bandwidth）：(UPPER - LOWER) / MID * 100
+        - 百分比（Percent）：(Close - LOWER) / (UPPER - LOWER) * 100
+        """
+        df = df.copy()
+        
+        # 计算中轨（20日均线）
+        df['BOLL_MID'] = df['close'].rolling(window=self.BOLL_LENGTH).mean()
+        
+        # 计算标准差
+        std = df['close'].rolling(window=self.BOLL_LENGTH).std()
+        
+        # 计算上轨和下轨
+        df['BOLL_UPPER'] = df['BOLL_MID'] + self.BOLL_STD * std
+        df['BOLL_LOWER'] = df['BOLL_MID'] - self.BOLL_STD * std
+        
+        # 计算布林带宽（波动率）
+        df['BOLL_BANDWIDTH'] = (df['BOLL_UPPER'] - df['BOLL_LOWER']) / df['BOLL_MID'] * 100
+        
+        # 计算布林百分比（价格在布林带中的位置）
+        df['BOLL_PERCENT'] = (df['close'] - df['BOLL_LOWER']) / (df['BOLL_UPPER'] - df['BOLL_LOWER']) * 100
+        df['BOLL_PERCENT'] = df['BOLL_PERCENT'].fillna(50)  # 填充NaN为中性值
+        
         return df
     
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
@@ -471,6 +543,12 @@ class StockTrendAnalyzer:
         if result.ma20 > 0 and price >= result.ma20:
             result.support_levels.append(result.ma20)
         
+        # 布林带支撑压力 - 新增
+        if hasattr(result, 'boll_lower') and result.boll_lower > 0 and price >= result.boll_lower:
+            result.support_levels.append(result.boll_lower)
+        if hasattr(result, 'boll_upper') and result.boll_upper > 0 and price <= result.boll_upper:
+            result.resistance_levels.append(result.boll_upper)
+        
         # 近期高点作为压力
         if len(df) >= 20:
             recent_high = df['high'].iloc[-20:].max()
@@ -580,9 +658,57 @@ class StockTrendAnalyzer:
             result.rsi_status = RSIStatus.OVERSOLD
             result.rsi_signal = f"⭐ RSI超卖({rsi_mid:.1f}<30)，反弹机会大"
 
+    def _analyze_boll(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        分析 BOLL（布林带）指标 - 新增
+        
+        核心逻辑：
+        - 价格突破上轨：超买，警惕回调
+        - 价格跌破下轨：超卖，关注反弹
+        - 价格在中轨上方：多头强势
+        - 价格在中轨下方：空头弱势
+        - 布林带宽：带宽收窄预示变盘，带宽扩大预示趋势延续
+        """
+        if len(df) < self.BOLL_LENGTH:
+            result.boll_signal = "数据不足"
+            return
+        
+        latest = df.iloc[-1]
+        price = result.current_price
+        
+        # 获取 BOLL 数据
+        result.boll_upper = float(latest['BOLL_UPPER'])
+        result.boll_mid = float(latest['BOLL_MID'])
+        result.boll_lower = float(latest['BOLL_LOWER'])
+        result.boll_bandwidth = float(latest['BOLL_BANDWIDTH'])
+        result.boll_percent = float(latest['BOLL_PERCENT'])
+        
+        # 判断 BOLL 状态
+        if price >= result.boll_upper:
+            result.boll_status = BOLLStatus.OVER_UPPER
+            result.boll_signal = f"⚠️ 价格突破布林上轨({result.boll_upper:.2f})，超买区间，警惕回调风险（当前位置：{result.boll_percent:.1f}%）"
+        elif price > result.boll_mid:
+            result.boll_status = BOLLStatus.ABOVE_MID
+            result.boll_signal = f"✅ 价格在布林中轨({result.boll_mid:.2f})上方，多头趋势占优（当前位置：{result.boll_percent:.1f}%）"
+        elif price > result.boll_lower:
+            result.boll_status = BOLLStatus.BELOW_MID
+            result.boll_signal = f"⚡ 价格在布林中轨下方，空头趋势占优（当前位置：{result.boll_percent:.1f}%）"
+        elif price <= result.boll_lower:
+            result.boll_status = BOLLStatus.UNDER_LOWER
+            result.boll_signal = f"⭐ 价格跌破布林下轨({result.boll_lower:.2f})，超卖区间，可能有反弹机会（当前位置：{result.boll_percent:.1f}%）"
+        else:
+            result.boll_status = BOLLStatus.CONSOLIDATION
+            result.boll_signal = f" 布林带缩口，波动率低({result.boll_bandwidth:.1f}%)，等待方向选择"
+        
+        # 补充带宽分析
+        if result.boll_bandwidth < 5:
+            result.boll_signal += " | 布林带极度缩口，即将变盘"
+        elif result.boll_bandwidth > 15:
+            result.boll_signal += " | 布林带大幅扩张，趋势延续性强"
+
     def _generate_signal(self, result: TrendAnalysisResult) -> None:
         """
-        生成买入信号
+        生成买入信号（新增BOLL评分逻辑）
 
         综合评分系统：
         - 趋势（30分）：多头排列得分高
@@ -591,6 +717,7 @@ class StockTrendAnalyzer:
         - 支撑（10分）：获得均线支撑得分高
         - MACD（15分）：金叉和多头得分高
         - RSI（10分）：超卖和强势得分高
+        - BOLL（新增5分）：超卖/中轨上方得分高，超买扣分
         """
         score = 0
         reasons = []
@@ -724,19 +851,38 @@ class StockTrendAnalyzer:
         else:
             reasons.append(result.rsi_signal)
 
+        # === BOLL 评分（新增5分）===
+        boll_scores = {
+            BOLLStatus.UNDER_LOWER: 5,     # 超卖最佳
+            BOLLStatus.ABOVE_MID: 4,       # 中轨上方
+            BOLLStatus.CONSOLIDATION: 2,   # 缩口震荡
+            BOLLStatus.BELOW_MID: 1,       # 中轨下方
+            BOLLStatus.OVER_UPPER: 0,      # 超买最差
+        }
+        boll_score = boll_scores.get(result.boll_status, 2)
+        score += boll_score
+
+        if result.boll_status in [BOLLStatus.UNDER_LOWER, BOLLStatus.ABOVE_MID]:
+            reasons.append(f"✅ {result.boll_signal}")
+        elif result.boll_status == BOLLStatus.OVER_UPPER:
+            risks.append(f"⚠️ {result.boll_signal}")
+        else:
+            reasons.append(result.boll_signal)
+
         # === 综合判断 ===
         result.signal_score = score
         result.signal_reasons = reasons
         result.risk_factors = risks
 
-        # 生成买入信号（调整阈值以适应新的100分制）
-        if score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
+        # 生成买入信号（调整阈值以适应新的105分制→归一到100分）
+        normalized_score = min(score, 100)  # 防止超过100分
+        if normalized_score >= 75 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL]:
             result.buy_signal = BuySignal.STRONG_BUY
-        elif score >= 60 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
+        elif normalized_score >= 60 and result.trend_status in [TrendStatus.STRONG_BULL, TrendStatus.BULL, TrendStatus.WEAK_BULL]:
             result.buy_signal = BuySignal.BUY
-        elif score >= 45:
+        elif normalized_score >= 45:
             result.buy_signal = BuySignal.HOLD
-        elif score >= 30:
+        elif normalized_score >= 30:
             result.buy_signal = BuySignal.WAIT
         elif result.trend_status in [TrendStatus.BEAR, TrendStatus.STRONG_BEAR]:
             result.buy_signal = BuySignal.STRONG_SELL
@@ -745,7 +891,7 @@ class StockTrendAnalyzer:
     
     def format_analysis(self, result: TrendAnalysisResult) -> str:
         """
-        格式化分析结果为文本
+        格式化分析结果为文本（新增BOLL展示）
 
         Args:
             result: 分析结果
@@ -781,6 +927,13 @@ class StockTrendAnalyzer:
             f"   RSI(12): {result.rsi_12:.1f}",
             f"   RSI(24): {result.rsi_24:.1f}",
             f"   信号: {result.rsi_signal}",
+            f"",
+            f"📊 BOLL指标: {result.boll_status.value} (新增)",  # 新增
+            f"   上轨: {result.boll_upper:.2f}",                 # 新增
+            f"   中轨: {result.boll_mid:.2f}",                   # 新增
+            f"   下轨: {result.boll_lower:.2f}",                 # 新增
+            f"   带宽: {result.boll_bandwidth:.1f}% | 位置: {result.boll_percent:.1f}%",  # 新增
+            f"   信号: {result.boll_signal}",                    # 新增
             f"",
             f"🎯 操作建议: {result.buy_signal.value}",
             f"   综合评分: {result.signal_score}/100",
